@@ -10,7 +10,7 @@
 
 (ns marshal.core
   (:refer-clojure :exclude [read struct vector float double])
-  (:import [java.nio ByteOrder]
+  (:import [java.nio ByteOrder ByteBuffer]
            [java.io InputStream OutputStream]))
 
 (def ^:dynamic *byte-order*  ByteOrder/LITTLE_ENDIAN)
@@ -33,7 +33,10 @@
 
 (extend-protocol ReadBytes
   InputStream
-   (read-proxy [s b off len] (.read s b off len)))
+  (read-proxy [s b off len] (.read s b off len))
+  ByteBuffer
+  (read-proxy [s b off len]
+    (.get s b off len) len))
 
 (defn read-bytes [s b sz off]
   (let  [len (- sz off)
@@ -60,13 +63,13 @@
   (m-size [o])
   (m-read [o])
   (m-write [o]))
-  
+
 (defn sizeof
   "returns the number of bytes"
   [x] (if (seq x)
 	 (reduce #(+ %1 (sizeof %2)) 0 x)
 	 ((m-size x))))
-  
+
 (def ^:private byte-offsets-le (map #(* 8 %) (range 8)))
 
 (def ^:private  byte-offsets-be (reverse byte-offsets-le))
@@ -82,18 +85,16 @@
   (let [shift (byte-offsets sz)]
     (count (for [s shift] (.write o (int (bit-and 0XFF (bit-shift-right v s))))))))
 
-(extend-protocol MarshalBytes
-  InputStream
-  (m-uval [s sz]
-    (let [v (byte-array sz)
+(defn- -m-uval [s sz]
+  (let [v (byte-array sz)
           n (read-bytes s v sz 0)
           shift (byte-offsets sz)]
       (if (<= sz 4)
         (reduce bit-or (map #(bit-shift-left (bit-and 0xFF %1) %2) v shift))
         (reduce +' (map #(*' (bit-and 0xFF %1) (bit-shift-left 1 %2)) v shift)))))
-      
-  (m-sval [s sz]
-    (let [v (byte-array sz)
+
+(defn- -m-sval [s sz]
+  (let [v (byte-array sz)
           n (read-bytes s v sz 0)
           shift (byte-offsets sz)]
       (if (= sz 1)
@@ -104,36 +105,56 @@
           (bit-or (bit-shift-left (last v) (last shift))
                   (reduce bit-or (map #(bit-shift-left (bit-and 0xFF %1) %2) (take (dec sz)  v) (take (dec sz)  shift))))))))
 
-        
-      ;;(reduce bit-or (map #(bit-shift-left %1 %2) v shift))))
-
-  (m-float [s _]
-    (let [v (byte-array 4)
+(defn- -m-float [s sz]
+  (let [v (byte-array 4)
           n (read-bytes s v 4 0)
           shift (byte-offsets 4)]
-      (Float/intBitsToFloat (reduce + (map #(bit-shift-left (bit-and 0xFF %1) %2) v shift)))))
+    (Float/intBitsToFloat (reduce + (map #(bit-shift-left (bit-and 0xFF %1) %2) v shift)))))
 
-  (m-double [s _]
-    (let [v (byte-array 8)
+(defn- -m-double [s sz]
+  (let [v (byte-array 8)
           n (read-bytes s v 8 0)
           shift (byte-offsets 8)]
       (Double/longBitsToDouble (reduce + (map #(bit-shift-left (bit-and 0xFF %1) %2) v shift)))))
 
-  (m-array [s [o sz]]
-    (loop [i 0 res (transient [])]
+(defn- -m-array [s [o sz]]
+  (loop [i 0 res (transient [])]
       (if (< i sz)
         (recur (inc i) (conj! res ((if (fn? o) o (m-read o)) s)))
         (persistent! res))))
 
-  (m-vector [s t]
-    (vec (map #((m-read %) s) t)))
+(defn- -m-vector [s t]
+  (vec (map #((m-read %) s) t)))
 
-  (m-struct [s struct-descr]
-    (loop [coll (seq struct-descr) res (transient {})]
+(defn- -m-struct [s struct-descr]
+  (loop [coll (seq struct-descr) res (transient {})]
       (if coll
         (let [[[k o] & xs] coll]
           (recur xs (assoc! res k ((m-read o) s res))))
         (persistent! res))))
+
+(extend-protocol MarshalBytes
+  InputStream
+  (m-uval [s sz]
+    (-m-uval s sz))
+
+  (m-sval [s sz]
+    (-m-sval s sz))
+
+  (m-float [s sz]
+    (-m-float s sz))
+
+  (m-double [s sz]
+    (-m-double s sz))
+
+  (m-array [s [o sz]]
+    (-m-array s [o sz]))
+
+  (m-vector [s t]
+    (-m-vector s t))
+
+  (m-struct [s struct-descr]
+    (-m-struct s struct-descr))
 
   (m-ascii-string [s sz]
     (let [^StringBuffer sb (StringBuffer.)]
@@ -141,29 +162,48 @@
         (.append sb (char (.read s))))
       (.trim (str sb))))
 
+  ByteBuffer
+  (m-uval [s sz]
+    (-m-uval s sz))
+  (m-sval [s sz]
+    (-m-sval s sz))
+  (m-float [s sz]
+    (-m-float s sz))
+  (m-double [s sz]
+    (-m-double s sz))
+  (m-array [s [o sz]]
+    (-m-array s [o sz]))
+  (m-struct [s struct-descr]
+    (-m-struct s struct-descr))
+  (m-ascii-string [s sz]
+    (let [^StringBuffer sb (StringBuffer.)]
+      (dotimes [i sz]
+        (.append sb (char (.get s i))))
+      (.trim (str sb))))
+
   OutputStream
   (m-uval [s [v sz]]
     (write-val s v sz))
-  
+
   (m-sval [s [v sz]]
     (write-val s v sz))
-  
+
   (m-float [s [v _]]
     (let [fv (Float/floatToIntBits v)
           ba (to-bytes fv 4)]
       (count (for [x ba] (.write s (int x))))))
-  
+
   (m-double [s [v _]]
     (let [dv (Double/doubleToLongBits v)
           ba (to-bytes dv 8)]
       (count (for [x ba] (.write s (int x))))))
-  
+
   (m-array [s [v o]]
       (reduce + (map #((if (fn? o) o (m-write o)) s %) v)))
-  
+
   (m-vector [s [v t]]
       (reduce + (map #((m-write %2) s %1) v t)))
-  
+
   (m-struct [s [v d]]
     (reduce + (map (fn [[n f]] ((m-write f) s (v n))) d)))
 
@@ -227,7 +267,7 @@
 (primitive-bool bool8 m-uval 1)
 (primitive-bool bool32 m-uval 4)
 
-(defn array 
+(defn array
   "marshals fixed size or variable length arrays of homogeneous type; variable length arrays must be members of structs in which case sz is either a function or a keyword returning the size of the array from map member(s); marshals to/from clojure vectors"
   [o sz]
   (if (or (keyword? sz) (fn? sz))
@@ -270,7 +310,7 @@
          (< l sz) (concat  val (take (- sz l) (repeat pad)))
          :else (.substring val 0 sz))))
 
-(defn ascii-string 
+(defn ascii-string
   "marshals a padded fixed width or variable length ASCII string; the default pad char is (char 0); variable length must be members of structs in which case sz is either a function or keyword returning the size of the string from map member(s)"
   [sz & pad]
   (if (or (keyword? sz) (fn? sz))
@@ -321,7 +361,7 @@
                   (seq [_] (seq types))
                   Marshal
                   (m-size [_] (fn [& args]
-                                (reduce + (map #(apply (m-size %) args) types)))) 
+                                (reduce + (map #(apply (m-size %) args) types))))
                   (m-read [_] (read-f m-struct m))
                   (m-write [_] (write-f m-struct m)))]
         (add-print-method (class obj))
@@ -341,7 +381,7 @@
                   (seq [_] (seq types))
                   Marshal
                   (m-size [_] (fn [& _]
-                                (sizeof types))) 
+                                (sizeof types)))
                   (m-read [_] (read-f m-vector types))
                   (m-write [_] (write-f m-vector types)))]
         (add-print-method (class obj))
